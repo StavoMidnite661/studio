@@ -1,3 +1,4 @@
+
 "use client";
 
 import * as React from "react";
@@ -42,7 +43,7 @@ interface ErrorResult {
 }
 
 // A simple mock for a Stripe Elements form
-const StripePaymentForm = ({ clientSecret, onPaymentSuccess }: { clientSecret: string, onPaymentSuccess: (ref: string) => void }) => {
+const StripePaymentForm = ({ clientSecret, onPaymentSuccess, amount }: { clientSecret: string, onPaymentSuccess: (ref: string) => void, amount: number }) => {
   const [paying, setPaying] = React.useState(false);
   const [paid, setPaid] = React.useState(false);
 
@@ -79,7 +80,7 @@ const StripePaymentForm = ({ clientSecret, onPaymentSuccess }: { clientSecret: s
         </div>
         <Button onClick={handlePay} disabled={paying || !clientSecret} className="w-full">
             {paying && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-            {paying ? 'Processing...' : `Pay $${(formValues.amount_usd).toFixed(2)}`}
+            {paying ? 'Processing...' : `Pay $${(amount).toFixed(2)}`}
         </Button>
         <p className="text-xs text-muted-foreground text-center">This is a simulated Stripe payment form.</p>
     </div>
@@ -100,7 +101,7 @@ export function CheckoutForm() {
     defaultValues: {
       order_id: "",
       amount_usd: 50.00,
-      payer: "0xUserWallet",
+      payer: "0xUserWallet", // This should be the connected user's wallet
       merchant_id: "merchant-001",
       site_order_id: "",
     },
@@ -112,7 +113,7 @@ export function CheckoutForm() {
     form.reset({
       order_id: randomOrderId,
       amount_usd: 50.00,
-      payer: "0xUserWallet",
+      payer: "0xUserWallet", // This should be the connected user's wallet
       merchant_id: "merchant-001",
       site_order_id: randomSiteOrderId,
     });
@@ -266,10 +267,11 @@ export function CheckoutForm() {
               </Alert>
             )}
             
-            {result?.clientSecret && (
+            {result?.clientSecret && formValues && (
                 <StripePaymentForm 
                     clientSecret={result.clientSecret} 
-                    onPaymentSuccess={handlePaymentSuccess} 
+                    onPaymentSuccess={handlePaymentSuccess}
+                    amount={formValues.amount_usd}
                 />
             )}
 
@@ -321,7 +323,7 @@ export function CheckoutForm() {
                  <Separator />
                 <div className="text-xs text-muted-foreground space-y-2">
                     <p>
-                      This USD-denominated transaction will be backed by your SOVR credit.
+                      This USD-denominated transaction will be backed by your POSCR credit.
                     </p>
                     <p>By clicking "Confirm & Pay", you agree to the Sovr.world Terms of Service and Privacy Policy. All charges are final and non-refundable.</p>
                     <p>This transaction will be recorded on a public ledger. Your payment is being processed via the Sovr.world USD Gateway.</p>
@@ -337,7 +339,7 @@ export function CheckoutForm() {
             </DialogClose>
             <Button type="button" onClick={processCheckout} disabled={isLoading} className="w-full sm:w-auto">
               {isLoading && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-              Confirm & Continue to Payment
+              Confirm & Pay
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -345,3 +347,5 @@ export function CheckoutForm() {
     </>
   );
 }
+
+    

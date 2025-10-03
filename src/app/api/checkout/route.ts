@@ -1,3 +1,4 @@
+
 import { NextResponse } from 'next/server';
 import crypto from 'crypto';
 import { stripeService } from '@/lib/stripe.service';
@@ -8,7 +9,7 @@ const {
   EVENTSTORE_API_KEY,
   EVENTSTORE_STREAM_PREFIX = 'orders',
   IDEMPOTENCY_WINDOW_MS = 300000, // 5 minutes
-  HONOR_VAULT_ADDRESS, // Added for SOVR sacrifice
+  // HONOR_VAULT_ADDRESS is no longer needed for this contract
 } = process.env;
 
 
@@ -95,26 +96,26 @@ export async function POST(req: Request) {
             order_id, amount_usd, payer, merchant_id, idempotency_key, metadata: metadata || {}
         });
 
-        // This is a simplified logic. A real implementation would calculate the SOVR amount based on a reliable price feed.
-        const sovrAmountToSacrifice = String(amount_usd); // 1:1 for now
+        const sovrAmountToBurn = String(amount_usd); // 1:1 for now, a real implementation would use a price feed.
 
-        // 1. Sacrifice SOVR tokens (using the mock service for now)
+        // 1. Burn POSCR tokens
         try {
-            if (!HONOR_VAULT_ADDRESS) throw new Error("HONOR_VAULT_ADDRESS is not configured");
-            
-            console.log(`Attempting to sacrifice ${sovrAmountToSacrifice} SOVR from ${payer} to HonorVault at ${HONOR_VAULT_ADDRESS}`);
-            const sacrificeResult = await sovrService.sacrificeSOVR(payer, sovrAmountToSacrifice, HONOR_VAULT_ADDRESS);
-            console.log('SOVR Sacrifice Result:', sacrificeResult);
+            console.log(`Attempting to burn ${sovrAmountToBurn} POSCR from ${payer} for retailer ${merchant_id}`);
+            // A real implementation would generate a meaningful compliance hash
+            const compliancePlaceholder = crypto.createHash('sha256').update(JSON.stringify({order_id, ts: Date.now()})).digest('hex');
+            const burnResult = await sovrService.burnForPOSPurchase(payer, sovrAmountToBurn, merchant_id, `0x${compliancePlaceholder}`);
+            console.log('POSCR Burn Result:', burnResult);
 
-            await publishEvent(stream, 'SovrSacrificed', {
+            await publishEvent(stream, 'TokensBurned', {
                 order_id,
-                amount: sovrAmountToSacrifice,
+                amount: sovrAmountToBurn,
                 payer,
-                honor_vault: HONOR_VAULT_ADDRESS,
-                transaction_hash: sacrificeResult.txHash
+                retailerId: merchant_id,
+                transaction_hash: burnResult.txHash,
+                compliancePayloadHash: `0x${compliancePlaceholder}`
             });
         } catch(err: any) {
-            await publishEvent(stream, 'PaymentFailed', { order_id, reason: `SOVR sacrifice failed: ${err.message}`, idempotency_key });
+            await publishEvent(stream, 'PaymentFailed', { order_id, reason: `POSCR token burn failed: ${err.message}`, idempotency_key });
             throw err;
         }
 
@@ -125,7 +126,8 @@ export async function POST(req: Request) {
             paymentIntent = await stripeService.createPaymentIntent(
               amount_usd * 100, // Stripe expects amount in cents
               'usd',
-              `Order ${order_id} for ${merchant_id}`
+              `Order ${order_id} for ${merchant_id}`,
+              { order_id } // Pass order_id in metadata
             );
             console.log('Stripe Payment Intent Created:', paymentIntent.id);
         
@@ -152,3 +154,5 @@ export async function POST(req: Request) {
         return NextResponse.json({ error: err.message || 'checkout_failed' }, { status: 500 });
     }
 }
+
+    

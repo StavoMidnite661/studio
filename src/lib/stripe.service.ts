@@ -1,10 +1,11 @@
+
 // @ts-nocheck
 import Stripe from 'stripe';
 
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
 
 class StripeService {
-  private stripe: Stripe;
+  public stripe: Stripe;
 
   constructor() {
     this.stripe = new Stripe(STRIPE_SECRET_KEY, {
@@ -12,11 +13,12 @@ class StripeService {
     });
   }
 
-  async createPaymentIntent(amount: number, currency: string, description: string): Promise<Stripe.PaymentIntent> {
+  async createPaymentIntent(amount: number, currency: string, description: string, metadata: object = {}): Promise<Stripe.PaymentIntent> {
     return this.stripe.paymentIntents.create({
       amount,
       currency,
       description,
+      metadata,
       automatic_payment_methods: { enabled: true },
     });
   }
@@ -31,3 +33,5 @@ class StripeService {
 }
 
 export const stripeService = new StripeService();
+
+    
