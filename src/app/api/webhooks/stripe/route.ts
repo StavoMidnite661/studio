@@ -1,3 +1,4 @@
+
 import { NextResponse } from 'next/server';
 import { headers } from 'next/headers';
 import Stripe from 'stripe';
@@ -12,7 +13,7 @@ const {
 } = process.env;
 
 if (!STRIPE_WEBHOOK_SECRET) {
-  console.error("Missing STRIPE_WEBHOOK_SECRET in env");
+  console.warn("STRIPE_WEBHOOK_SECRET is not set. Webhook will not function.");
 }
 
 async function publishEvent(streamName: string, eventType: string, data: object): Promise<boolean> {
@@ -46,7 +47,8 @@ async function publishEvent(streamName: string, eventType: string, data: object)
 
 export async function POST(req: Request) {
     if (!STRIPE_WEBHOOK_SECRET) {
-      return NextResponse.json({ error: 'Stripe webhook secret not configured.' }, { status: 500 });
+      console.log("Received Stripe webhook, but no secret is configured. Ignoring.");
+      return NextResponse.json({ received: true, message: "Webhook ignored, no secret configured." });
     }
     
     const body = await req.text();
