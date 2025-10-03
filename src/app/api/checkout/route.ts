@@ -1,23 +1,24 @@
 import { NextResponse } from 'next/server';
 import crypto from 'crypto';
+import { stripeService } from '@/lib/stripe.service';
+import { sovrService } from '@/lib/sovr.service';
 
 const {
   EVENTSTORE_BASE,
   EVENTSTORE_API_KEY,
   EVENTSTORE_STREAM_PREFIX = 'orders',
-  FUNDING_SERVICE_URL,
-  FUNDING_SERVICE_KEY,
   IDEMPOTENCY_WINDOW_MS = 300000, // 5 minutes
+  HONOR_VAULT_ADDRESS, // Added for SOVR sacrifice
 } = process.env;
+
 
 if (!EVENTSTORE_BASE) {
   console.error('Missing EVENTSTORE_BASE in env');
-  // In a real app, this should prevent startup, but for API routes, we check at runtime.
+}
+if (!process.env.STRIPE_SECRET_KEY) {
+  console.error('Missing STRIPE_SECRET_KEY in env');
 }
 
-// Basic in-memory idempotency guard.
-// NOTE: This is not suitable for production serverless environments as each invocation
-// can be a separate instance. Use a distributed cache like Redis for production.
 const recentRequests = new Map<string, number>();
 
 function isDuplicate(key: string): boolean {
@@ -27,7 +28,6 @@ function isDuplicate(key: string): boolean {
     return true;
   }
   recentRequests.set(key, now);
-  // Simple cleanup to prevent memory leaks in a long-running process.
   if (recentRequests.size > 10000) {
     const oldestKey = recentRequests.keys().next().value;
     recentRequests.delete(oldestKey);
@@ -35,7 +35,6 @@ function isDuplicate(key: string): boolean {
   return false;
 }
 
-// Helper to publish to EventStore
 async function publishEvent(streamName: string, eventType: string, data: object): Promise<boolean> {
     const event = [{
         eventId: crypto.randomUUID(),
@@ -61,33 +60,10 @@ async function publishEvent(streamName: string, eventType: string, data: object)
     return true;
 }
 
-// Optional: call funding service to verify SOVR backing
-async function verifyFunding(orderId: string, amountUsd: number, payer: string, idempotencyKey: string): Promise<any> {
-    if (!FUNDING_SERVICE_URL) {
-        return { ok: true, note: 'no funding service configured' };
-    }
-    const resp = await fetch(`${FUNDING_SERVICE_URL.replace(/\/$/, '')}/verify`, {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            ...(FUNDING_SERVICE_KEY ? { 'Authorization': `Bearer ${FUNDING_SERVICE_KEY}` } : {})
-        },
-        body: JSON.stringify({ order_id: orderId, amount_usd: amountUsd, payer, idempotency_key: idempotencyKey })
-    });
-
-    if (!resp.ok) {
-        const txt = await resp.text().catch(() => '<no body>');
-        throw new Error(`Funding verification failed: ${resp.status} ${txt}`);
-    }
-    const payload = await resp.json();
-    // expected payload: { ok: true, settlement_reference: "...", usd_equivalent_rate: 1.0 }
-    return payload;
-}
-
 interface CheckoutRequestBody {
     order_id: string;
     amount_usd: number;
-    payer: string;
+    payer: string; // This should be the user's wallet address
     merchant_id: string;
     site_order_id?: string;
     metadata?: object;
@@ -95,8 +71,8 @@ interface CheckoutRequestBody {
 }
 
 export async function POST(req: Request) {
-    if (!EVENTSTORE_BASE) {
-      return NextResponse.json({ error: 'Gateway not configured: EVENTSTORE_BASE is missing.' }, { status: 500 });
+    if (!EVENTSTORE_BASE || !process.env.STRIPE_SECRET_KEY) {
+      return NextResponse.json({ error: 'Gateway not configured correctly.' }, { status: 500 });
     }
 
     try {
@@ -104,58 +80,71 @@ export async function POST(req: Request) {
         const { order_id, amount_usd, payer, merchant_id, site_order_id, metadata } = body;
 
         if (!order_id || amount_usd === undefined || !payer || !merchant_id) {
-            return NextResponse.json({ error: 'Missing required fields: order_id, amount_usd, payer, merchant_id' }, { status: 400 });
+            return NextResponse.json({ error: 'Missing required fields' }, { status: 400 });
         }
 
-        const idempotency_key = body.idempotency_key || crypto.createHash('sha256').update(String(order_id) + String(amount_usd) + String(payer)).digest('hex');
+        const idempotency_key = body.idempotency_key || crypto.createHash('sha256').update(JSON.stringify(body)).digest('hex');
 
         if (isDuplicate(idempotency_key)) {
-            return NextResponse.json({ error: 'Duplicate request (idempotency)', idempotency_key }, { status: 409 });
+            return NextResponse.json({ error: 'Duplicate request' }, { status: 409 });
         }
 
         const stream = `${EVENTSTORE_STREAM_PREFIX}-${order_id}`;
 
-        // 1) Publish PaymentInitiated
         await publishEvent(stream, 'PaymentInitiated', {
             order_id, amount_usd, payer, merchant_id, idempotency_key, metadata: metadata || {}
         });
 
-        // 2) Verify funding
-        let fundingResp;
+        // This is a simplified logic. A real implementation would calculate the SOVR amount based on a reliable price feed.
+        const sovrAmountToSacrifice = String(amount_usd); // 1:1 for now
+
+        // 1. Sacrifice SOVR tokens (using the mock service for now)
         try {
-            fundingResp = await verifyFunding(order_id, amount_usd, payer, idempotency_key);
-        } catch (err: any) {
-            await publishEvent(stream, 'PaymentFailed', { order_id, reason: err.message, idempotency_key });
+            if (!HONOR_VAULT_ADDRESS) throw new Error("HONOR_VAULT_ADDRESS is not configured");
+            
+            console.log(`Attempting to sacrifice ${sovrAmountToSacrifice} SOVR from ${payer} to HonorVault at ${HONOR_VAULT_ADDRESS}`);
+            const sacrificeResult = await sovrService.sacrificeSOVR(payer, sovrAmountToSacrifice, HONOR_VAULT_ADDRESS);
+            console.log('SOVR Sacrifice Result:', sacrificeResult);
+
+            await publishEvent(stream, 'SovrSacrificed', {
+                order_id,
+                amount: sovrAmountToSacrifice,
+                payer,
+                honor_vault: HONOR_VAULT_ADDRESS,
+                transaction_hash: sacrificeResult.txHash
+            });
+        } catch(err: any) {
+            await publishEvent(stream, 'PaymentFailed', { order_id, reason: `SOVR sacrifice failed: ${err.message}`, idempotency_key });
             throw err;
         }
 
-        const settlement_reference = fundingResp.settlement_reference || crypto.randomUUID();
-        const usd_equivalent_rate = fundingResp.usd_equivalent_rate || 1.0;
-
-        // 3) Publish PaymentAuthorized
-        await publishEvent(stream, 'PaymentAuthorized', {
-            order_id,
-            amount_usd,
-            usd_equivalent_rate,
-            settled_at: new Date().toISOString(),
-            settlement_reference
-        });
-
-        // 4) Publish OrderSettled
-        await publishEvent(stream, 'OrderSettled', {
-            order_id,
-            site_order_id: site_order_id || null,
-            merchant_receipt: settlement_reference
-        });
+        // 2. Create Stripe Payment Intent for USD
+        let paymentIntent;
+        try {
+            console.log(`Creating Stripe Payment Intent for ${amount_usd} USD`);
+            paymentIntent = await stripeService.createPaymentIntent(
+              amount_usd * 100, // Stripe expects amount in cents
+              'usd',
+              `Order ${order_id} for ${merchant_id}`
+            );
+            console.log('Stripe Payment Intent Created:', paymentIntent.id);
         
-        // 5) Return success
+            await publishEvent(stream, 'PaymentIntentCreated', {
+                order_id,
+                payment_intent_id: paymentIntent.id,
+                amount_usd: amount_usd,
+            });
+
+        } catch (err: any) {
+            await publishEvent(stream, 'PaymentFailed', { order_id, reason: `Stripe Payment Intent creation failed: ${err.message}`, idempotency_key });
+            throw err;
+        }
+        
+        // 3) Return the client secret to the frontend
         return NextResponse.json({
             ok: true,
             order_id,
-            amount_usd,
-            settlement_reference,
-            usd_equivalent_rate,
-            note: fundingResp.note || null
+            clientSecret: paymentIntent.client_secret
         });
 
     } catch (err: any) {

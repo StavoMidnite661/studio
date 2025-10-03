@@ -34,15 +34,58 @@ type CheckoutFormValues = z.infer<typeof formSchema>;
 interface CheckoutResult {
   ok: boolean;
   order_id: string;
-  amount_usd: number;
-  settlement_reference: string;
-  usd_equivalent_rate: number;
-  note: string | null;
+  clientSecret: string;
 }
 
 interface ErrorResult {
   error: string;
 }
+
+// A simple mock for a Stripe Elements form
+const StripePaymentForm = ({ clientSecret, onPaymentSuccess }: { clientSecret: string, onPaymentSuccess: (ref: string) => void }) => {
+  const [paying, setPaying] = React.useState(false);
+  const [paid, setPaid] = React.useState(false);
+
+  const handlePay = () => {
+    setPaying(true);
+    // In a real app, you would use Stripe.js to confirm the payment.
+    // This is a simulation.
+    setTimeout(() => {
+      setPaying(false);
+      setPaid(true);
+      // Simulate getting a settlement reference back
+      const settlementReference = `pi_${Math.random().toString(36).substring(2)}`;
+      onPaymentSuccess(settlementReference);
+    }, 2000);
+  };
+  
+  if (paid) {
+    return (
+       <Alert>
+          <CheckCircle className="h-4 w-4" />
+          <AlertTitle>Payment Successful!</AlertTitle>
+          <AlertDescription>
+            Your payment has been processed.
+          </AlertDescription>
+        </Alert>
+    )
+  }
+
+  return (
+    <div className="border rounded-lg p-4 space-y-4 bg-muted/20">
+        <h3 className="font-medium text-center">Complete Payment with Stripe</h3>
+        <div className="h-10 w-full bg-background rounded-md border flex items-center px-3 text-sm text-muted-foreground">
+            Mock Card Details
+        </div>
+        <Button onClick={handlePay} disabled={paying || !clientSecret} className="w-full">
+            {paying && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+            {paying ? 'Processing...' : `Pay $${(formValues.amount_usd).toFixed(2)}`}
+        </Button>
+        <p className="text-xs text-muted-foreground text-center">This is a simulated Stripe payment form.</p>
+    </div>
+  )
+}
+
 
 export function CheckoutForm() {
   const [isLoading, setIsLoading] = React.useState(false);
@@ -50,12 +93,13 @@ export function CheckoutForm() {
   const [error, setError] = React.useState<string | null>(null);
   const [isConfirming, setIsConfirming] = React.useState(false);
   const [formValues, setFormValues] = React.useState<CheckoutFormValues | null>(null);
+  const [paymentSuccessRef, setPaymentSuccessRef] = React.useState<string | null>(null);
 
   const form = useForm<CheckoutFormValues>({
     resolver: zodResolver(formSchema),
     defaultValues: {
       order_id: "",
-      amount_usd: 500,
+      amount_usd: 50.00,
       payer: "0xUserWallet",
       merchant_id: "merchant-001",
       site_order_id: "",
@@ -63,12 +107,11 @@ export function CheckoutForm() {
   });
 
   React.useEffect(() => {
-    // Avoid hydration errors with Math.random
     const randomOrderId = `ORD-${Math.random().toString(36).substring(2, 9).toUpperCase()}`;
     const randomSiteOrderId = `SITE-${Math.random().toString(36).substring(2, 9).toUpperCase()}`;
     form.reset({
       order_id: randomOrderId,
-      amount_usd: 500.00,
+      amount_usd: 50.00,
       payer: "0xUserWallet",
       merchant_id: "merchant-001",
       site_order_id: randomSiteOrderId,
@@ -79,6 +122,9 @@ export function CheckoutForm() {
   async function handleFormSubmit(values: CheckoutFormValues) {
     setFormValues(values);
     setIsConfirming(true);
+    setError(null);
+    setResult(null);
+    setPaymentSuccessRef(null);
   }
 
   async function processCheckout() {
@@ -103,18 +149,23 @@ export function CheckoutForm() {
       }
       
       setResult(responseData as CheckoutResult);
-      // Reset form with a new order ID for the next transaction
-      form.reset({
-        ...form.getValues(),
-        order_id: `ORD-${Math.random().toString(36).substring(2, 9).toUpperCase()}`,
-        site_order_id: `SITE-${Math.random().toString(36).substring(2, 9).toUpperCase()}`,
-      });
 
     } catch (err: any) {
       setError(err.message);
     } finally {
       setIsLoading(false);
     }
+  }
+  
+  const handlePaymentSuccess = (reference: string) => {
+    setPaymentSuccessRef(reference);
+    // Reset form for next transaction
+     form.reset({
+        ...form.getValues(),
+        order_id: `ORD-${Math.random().toString(36).substring(2, 9).toUpperCase()}`,
+        site_order_id: `SITE-${Math.random().toString(36).substring(2, 9).toUpperCase()}`,
+      });
+     setResult(null); // Clear the client secret form
   }
 
   const processingFee = formValues ? (formValues.amount_usd * 0.01).toFixed(2) : '0.00';
@@ -152,7 +203,7 @@ export function CheckoutForm() {
                   <FormItem>
                     <FormLabel>Amount (USD)</FormLabel>
                     <FormControl>
-                      <Input type="number" step="0.01" placeholder="500.00" {...field} />
+                      <Input type="number" step="0.01" placeholder="50.00" {...field} />
                     </FormControl>
                     <FormMessage />
                   </FormItem>
@@ -198,7 +249,7 @@ export function CheckoutForm() {
                 )}
               />
               <Button type="submit" className="w-full bg-primary hover:bg-primary/90 text-primary-foreground" disabled={isLoading}>
-                {isLoading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+                {(isLoading || isConfirming) ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
                 Pay Now
               </Button>
             </form>
@@ -215,15 +266,21 @@ export function CheckoutForm() {
               </Alert>
             )}
             
-            {result && (
+            {result?.clientSecret && (
+                <StripePaymentForm 
+                    clientSecret={result.clientSecret} 
+                    onPaymentSuccess={handlePaymentSuccess} 
+                />
+            )}
+
+            {paymentSuccessRef && (
               <Alert>
                 <CheckCircle className="h-4 w-4" />
-                <AlertTitle>Payment Successful</AlertTitle>
+                <AlertTitle>Payment Complete</AlertTitle>
                 <AlertDescription className="break-all">
                   <div className="space-y-1 mt-2">
                     <span className="text-sm font-medium text-muted-foreground">Settlement Reference:</span>
-                    <p className="font-mono text-sm bg-muted p-2 rounded-md text-foreground">{result.settlement_reference}</p>
-                    {result.note && <p className="mt-2 text-xs text-muted-foreground">{result.note}</p>}
+                    <p className="font-mono text-sm bg-muted p-2 rounded-md text-foreground">{paymentSuccessRef}</p>
                   </div>
                 </AlertDescription>
               </Alert>
@@ -280,7 +337,7 @@ export function CheckoutForm() {
             </DialogClose>
             <Button type="button" onClick={processCheckout} disabled={isLoading} className="w-full sm:w-auto">
               {isLoading && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-              Confirm & Pay
+              Confirm & Continue to Payment
             </Button>
           </DialogFooter>
         </DialogContent>
