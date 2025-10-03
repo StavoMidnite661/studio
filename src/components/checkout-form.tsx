@@ -63,14 +63,18 @@ export function CheckoutForm() {
   });
 
   React.useEffect(() => {
+    // Avoid hydration errors with Math.random
+    const randomOrderId = `ORD-${Math.random().toString(36).substring(2, 9).toUpperCase()}`;
+    const randomSiteOrderId = `SITE-${Math.random().toString(36).substring(2, 9).toUpperCase()}`;
     form.reset({
-      order_id: `ORD-${Math.random().toString(36).substring(2, 9).toUpperCase()}`,
+      order_id: randomOrderId,
       amount_usd: 500.00,
       payer: "0xUserWallet",
       merchant_id: "merchant-001",
-      site_order_id: `SITE-${Math.random().toString(36).substring(2, 9).toUpperCase()}`,
+      site_order_id: randomSiteOrderId,
     });
   }, [form]);
+
 
   async function handleFormSubmit(values: CheckoutFormValues) {
     setFormValues(values);
@@ -241,24 +245,27 @@ export function CheckoutForm() {
                 <div className="space-y-2">
                     <div className="flex justify-between items-center">
                         <span className="text-muted-foreground">Amount</span>
-                        <span className="font-medium">${formValues.amount_usd.toFixed(2)}</span>
+                        <span className="font-medium">${formValues.amount_usd.toFixed(2)} USD</span>
                     </div>
                     <div className="flex justify-between items-center">
                         <span className="text-muted-foreground">Processing Fee (1%)</span>
-                        <span className="font-medium">${processingFee}</span>
+                        <span className="font-medium">${processingFee} USD</span>
                     </div>
                      <div className="flex justify-between items-center">
                         <span className="text-muted-foreground">Network Fee</span>
-                        <span className="font-medium">${networkFee}</span>
+                        <span className="font-medium">${networkFee} USD</span>
                     </div>
                     <Separator />
                     <div className="flex justify-between items-center font-bold text-lg">
                         <span>Total</span>
-                        <span>${totalAmount}</span>
+                        <span>${totalAmount} USD</span>
                     </div>
                 </div>
                  <Separator />
                 <div className="text-xs text-muted-foreground space-y-2">
+                    <p>
+                      This USD-denominated transaction will be backed by your SOVR credit.
+                    </p>
                     <p>By clicking "Confirm & Pay", you agree to the Sovr.world Terms of Service and Privacy Policy. All charges are final and non-refundable.</p>
                     <p>This transaction will be recorded on a public ledger. Your payment is being processed via the Sovr.world USD Gateway.</p>
                      <a href="https://www.gateway.sovr.world/" target="_blank" rel="noopener noreferrer" className="text-primary hover:underline inline-flex items-center gap-1">
