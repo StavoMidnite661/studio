@@ -1,6 +1,7 @@
 
 // @ts-nocheck
 // This service interacts with the POSCreditToken smart contract.
+import 'server-only';
 import Web3 from 'web3';
 import POSCreditTokenABI from './abi/POSCreditToken.json';
 
@@ -16,17 +17,23 @@ class SOVRService {
 
   constructor() {
     console.log("SOVRService initialized for POSCreditToken");
-    this.web3 = new Web3(new Web3.providers.WebsocketProvider(POLYGON_WS_URL));
+
+    // web3@4: let URL decide provider (ws/http)
+    this.web3 = new Web3(POLYGON_WS_URL);
+
     this.poscrTokenContract = new this.web3.eth.Contract(
-      POSCreditTokenABI,
+      POSCreditTokenABI as any,
       POSCR_CONTRACT_ADDRESS
     );
 
     if (GATEWAY_OPERATOR_PRIVATE_KEY) {
-        this.operatorAccount = this.web3.eth.accounts.privateKeyToAccount(GATEWAY_OPERATOR_PRIVATE_KEY);
-        this.web3.eth.accounts.wallet.add(this.operatorAccount);
-        this.web3.eth.defaultAccount = this.operatorAccount.address;
-        console.log(`SOVRService operator account set to: ${this.operatorAccount.address}`);
+      if (!GATEWAY_OPERATOR_PRIVATE_KEY.startsWith('0x')) {
+        throw new Error('GATEWAY_OPERATOR_PRIVATE_KEY must be 0x-prefixed');
+      }
+      this.operatorAccount = this.web3.eth.accounts.privateKeyToAccount(GATEWAY_OPERATOR_PRIVATE_KEY);
+      this.web3.eth.accounts.wallet.add(this.operatorAccount);
+      this.web3.eth.defaultAccount = this.operatorAccount.address;
+      console.log(`SOVRService operator account set to: ${this.operatorAccount.address}`);
     } else {
         console.error("GATEWAY_OPERATOR_PRIVATE_KEY is not set. Transactions will fail.");
     }
