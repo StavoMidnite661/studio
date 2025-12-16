@@ -1,164 +1,139 @@
+import { NextResponse } from "next/server";
+import Stripe from "stripe";
+import { z } from "zod";
+// Adjust import path to point to backend/attestor-client.js in project root
+// @ts-ignore
+import { requestAttestation } from "../../../../backend/attestor-client"; 
+import fs from "fs";
+import path from "path";
+import { getOracleLedgerClient, ORACLE_ACCOUNTS } from "@/lib/oracle-ledger.service";
 
-import { NextResponse } from 'next/server';
-import crypto from 'crypto';
-import { stripeService } from '@/lib/stripe.service';
-import { sovrService } from '@/lib/sovr.service';
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!, {
+  apiVersion: "2024-06-20",
+});
 
-const {
-  EVENTSTORE_BASE,
-  EVENTSTORE_API_KEY,
-  EVENTSTORE_STREAM_PREFIX = 'orders',
-  IDEMPOTENCY_WINDOW_MS = 300000, // 5 minutes
-  // HONOR_VAULT_ADDRESS is no longer needed for this contract
-} = process.env;
+const CheckoutSchema = z.object({
+  amount: z.number().min(0.01),
+  wallet: z.string().min(5),
+  merchantId: z.string().min(1),
+  orderId: z.string().min(1),
+  burnPOSCR: z.boolean().optional().default(false),
+});
 
+const LEDGER_PATH = path.join(process.cwd(), "ledger.json");
 
-if (!EVENTSTORE_BASE) {
-  console.error('Missing EVENTSTORE_BASE in env');
-}
-// We no longer need to error out if STRIPE_SECRET_KEY is missing in sandbox mode
-// if (!process.env.STRIPE_SECRET_KEY) {
-//   console.error('Missing STRIPE_SECRET_KEY in env');
-// }
-
-const recentRequests = new Map<string, number>();
-
-function isDuplicate(key: string): boolean {
-  const now = Date.now();
-  const last = recentRequests.get(key);
-  if (last && now - last < Number(IDEMPOTENCY_WINDOW_MS)) {
-    return true;
+function writeLedgerEntry(requestId: string, item: any) {
+  let ledger = {};
+  if (fs.existsSync(LEDGER_PATH)) {
+      try {
+        ledger = JSON.parse(fs.readFileSync(LEDGER_PATH, "utf8"));
+      } catch (e) {
+          console.error("Error reading ledger:", e);
+      }
   }
-  recentRequests.set(key, now);
-  if (recentRequests.size > 10000) {
-    const oldestKey = recentRequests.keys().next().value;
-    recentRequests.delete(oldestKey);
-  }
-  return false;
-}
-
-async function publishEvent(streamName: string, eventType: string, data: object): Promise<boolean> {
-    const event = [{
-        eventId: crypto.randomUUID(),
-        eventType,
-        data
-    }];
-    const url = `${EVENTSTORE_BASE}/streams/${encodeURIComponent(streamName)}`;
-    const res = await fetch(url, {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/vnd.eventstore.events+json',
-            ...(EVENTSTORE_API_KEY ? { 'ES-ApiKey': EVENTSTORE_API_KEY } : {})
-        },
-        body: JSON.stringify(event)
-    });
-
-    if (!res.ok) {
-        const txt = await res.text().catch(() => '<no body>');
-        const err = new Error(`EventStore publish failed: ${res.status} ${txt}`);
-        (err as any).status = res.status;
-        throw err;
-    }
-    return true;
-}
-
-interface CheckoutRequestBody {
-    order_id: string;
-    amount_usd: number;
-    payer: string; // This should be the user's wallet address
-    merchant_id: string;
-    site_order_id?: string;
-    metadata?: object;
-    idempotency_key?: string;
+  (ledger as any)[requestId] = item;
+  fs.writeFileSync(LEDGER_PATH, JSON.stringify(ledger, null, 2));
 }
 
 export async function POST(req: Request) {
-    if (!EVENTSTORE_BASE) {
-      return NextResponse.json({ error: 'Gateway not configured correctly.' }, { status: 500 });
+  try {
+    const json = await req.json();
+    const parsed = CheckoutSchema.safeParse(json);
+
+    if (!parsed.success) {
+      return NextResponse.json(
+        { error: "Invalid request", details: parsed.error.format() },
+        { status: 400 }
+      );
     }
 
+    const { amount, wallet, merchantId, orderId, burnPOSCR } = parsed.data;
+    const requestId = `req_${Date.now()}_${Math.random().toString(36).slice(2,8)}`;
+    const timestamp = Math.floor(Date.now() / 1000);
+    const payload = { requestId, wallet, amount, merchantId, orderId, timestamp };
+
+    // Initialize Oracle Ledger client
+    const oracleClient = getOracleLedgerClient();
+
+    // 1) Request attestation from Attestor Network
+    let attestation;
     try {
-        const body: CheckoutRequestBody = await req.json();
-        const { order_id, amount_usd, payer, merchant_id, site_order_id, metadata } = body;
-
-        if (!order_id || amount_usd === undefined || !payer || !merchant_id) {
-            return NextResponse.json({ error: 'Missing required fields' }, { status: 400 });
-        }
-
-        const idempotency_key = body.idempotency_key || crypto.createHash('sha256').update(JSON.stringify(body)).digest('hex');
-
-        if (isDuplicate(idempotency_key)) {
-            return NextResponse.json({ error: 'Duplicate request' }, { status: 409 });
-        }
-
-        const stream = `${EVENTSTORE_STREAM_PREFIX}-${order_id}`;
-
-        await publishEvent(stream, 'PaymentInitiated', {
-            order_id, amount_usd, payer, merchant_id, idempotency_key, metadata: metadata || {}
-        });
-
-        const sovrAmountToBurn = String(amount_usd); // 1:1 for now, a real implementation would use a price feed.
-
-        // 1. Burn POSCR tokens
-        try {
-            console.log(`Attempting to burn ${sovrAmountToBurn} POSCR from ${payer} for retailer ${merchant_id}`);
-            // A real implementation would generate a meaningful compliance hash
-            const compliancePlaceholder = crypto.createHash('sha256').update(JSON.stringify({order_id, ts: Date.now()})).digest('hex');
-            const burnResult = await sovrService.burnForPOSPurchase(payer, sovrAmountToBurn, merchant_id, `0x${compliancePlaceholder}`);
-            console.log('POSCR Burn Result:', burnResult);
-
-            await publishEvent(stream, 'TokensBurned', {
-                order_id,
-                amount: sovrAmountToBurn,
-                payer,
-                retailerId: merchant_id,
-                transaction_hash: burnResult.txHash,
-                compliancePayloadHash: `0x${compliancePlaceholder}`
-            });
-        } catch(err: any) {
-            await publishEvent(stream, 'PaymentFailed', { order_id, reason: `POSCR token burn failed: ${err.message}`, idempotency_key });
-            throw err;
-        }
-
-        // 2. Create Stripe Payment Intent for USD (or mock it)
-        let clientSecret;
-        if (process.env.STRIPE_SECRET_KEY) {
-             console.log(`Creating Stripe Payment Intent for ${amount_usd} USD`);
-             const paymentIntent = await stripeService.createPaymentIntent(
-                amount_usd * 100, // Stripe expects amount in cents
-                'usd',
-                `Order ${order_id} for ${merchant_id}`,
-                { order_id } // Pass order_id in metadata
-             );
-             clientSecret = paymentIntent.client_secret;
-             console.log('Stripe Payment Intent Created:', paymentIntent.id);
-        
-             await publishEvent(stream, 'PaymentIntentCreated', {
-                 order_id,
-                 payment_intent_id: paymentIntent.id,
-                 amount_usd: amount_usd,
-             });
-        } else {
-            console.log("STRIPE_SECRET_KEY not found. Simulating Stripe Payment Intent.");
-            // Create a mock client secret for sandbox testing without real Stripe credentials.
-            clientSecret = `pi_${crypto.randomBytes(16).toString('hex')}_secret_${crypto.randomBytes(24).toString('hex')}`;
-            await publishEvent(stream, 'PaymentIntentCreated', {
-                 order_id,
-                 payment_intent_id: clientSecret.split('_secret_')[0],
-                 amount_usd: amount_usd,
-                 simulated: true,
-             });
-        }
-        
-        // 3) Return the client secret to the frontend
-        return NextResponse.json({
-            ok: true,
-            order_id,
-            clientSecret: clientSecret
-        });
-
-    } catch (err: any) {
-        console.error('Checkout error:', err);
-        return NextResponse.json({ error: err.message || 'checkout_failed' }, { status: 500 });
+        attestation = await requestAttestation(payload); // { signature, signer, expiresAt, rawPayload }
+    } catch (e: any) {
+        console.error("Attestation failed:", e);
+        return NextResponse.json({ error: "Attestation failed: " + e.message }, { status: 500 });
     }
+
+    // 2) Record in Oracle Ledger: Attestation event
+    const attestationJournal = await oracleClient.createJournalEntry(
+      `Checkout attestation: ${requestId} - $${amount.toFixed(2)} for ${wallet}`,
+      [
+        // Memo entry for audit trail (no balance change)
+        { accountId: ORACLE_ACCOUNTS.CASH_VAULT_USDC, type: "DEBIT", amount: 0, description: `Attestor: ${attestation.signer}` },
+        { accountId: ORACLE_ACCOUNTS.CASH_VAULT_USDC, type: "CREDIT", amount: 0, description: `Order: ${orderId}` },
+      ],
+      "ATTESTATION",
+      { eventId: requestId, userId: wallet }
+    );
+    console.log(`[Checkout] Oracle Ledger attestation recorded: ${attestationJournal.journalEntryId}`);
+
+    // 3) Record ledger row (file-based): attested + payment intent to follow
+    const ledgerRow = {
+      requestId,
+      status: "attested",
+      payload,
+      attestation,
+      burnRequested: !!burnPOSCR,
+      createdAt: Date.now(),
+      paymentIntentId: null as string | null,
+      clientSecret: null as string | null,
+      oracleJournalIds: [attestationJournal.journalEntryId] as string[],
+    };
+    writeLedgerEntry(requestId, ledgerRow);
+
+    // 4) Create Stripe PaymentIntent with attestation metadata
+    const intent = await stripe.paymentIntents.create({
+      amount: Math.round(amount * 100),
+      currency: "usd",
+      metadata: {
+        requestId,
+        orderId,
+        merchantId,
+        attestationSigner: attestation.signer,
+        attestationExpiresAt: attestation.expiresAt,
+        oracleJournalId: attestationJournal.journalEntryId || "",
+      },
+      automatic_payment_methods: { enabled: true },
+    });
+
+    // 5) Record in Oracle Ledger: Payment Intent created
+    const paymentJournal = await oracleClient.createJournalEntry(
+      `Payment intent created: ${intent.id} - $${amount.toFixed(2)}`,
+      [
+        // Memo entry for audit trail (balance will change after payment confirmation)
+        { accountId: ORACLE_ACCOUNTS.STRIPE_CLEARING, type: "DEBIT", amount: 0, description: `Intent: ${intent.id}` },
+        { accountId: ORACLE_ACCOUNTS.STRIPE_CLEARING, type: "CREDIT", amount: 0, description: `Pending payment: ${requestId}` },
+      ],
+      "PAYMENT",
+      { eventId: requestId, userId: wallet }
+    );
+    console.log(`[Checkout] Oracle Ledger payment intent recorded: ${paymentJournal.journalEntryId}`);
+
+    // 6) Update file-based ledger with payment intent details
+    ledgerRow.status = "payment_intent_created";
+    ledgerRow.paymentIntentId = intent.id;
+    ledgerRow.clientSecret = intent.client_secret;
+    ledgerRow.oracleJournalIds.push(paymentJournal.journalEntryId || "");
+    writeLedgerEntry(requestId, ledgerRow);
+
+    return NextResponse.json({
+      requestId,
+      clientSecret: intent.client_secret,
+      paymentIntentId: intent.id,
+      oracleJournalIds: ledgerRow.oracleJournalIds,
+    });
+  } catch (err: any) {
+    console.error("Checkout Error:", err);
+    return NextResponse.json({ error: err.message || "Internal Server Error" }, { status: 500 });
+  }
 }

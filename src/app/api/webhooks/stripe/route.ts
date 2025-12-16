@@ -3,6 +3,7 @@ import { NextResponse } from 'next/server';
 import { headers } from 'next/headers';
 import Stripe from 'stripe';
 import { stripeService } from '@/lib/stripe.service';
+import { sovrService } from '@/lib/sovr.service';
 import crypto from 'crypto';
 
 const {
@@ -27,19 +28,26 @@ async function publishEvent(streamName: string, eventType: string, data: object)
         data
     }];
     const url = `${EVENTSTORE_BASE}/streams/${encodeURIComponent(streamName)}`;
-    const res = await fetch(url, {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/vnd.eventstore.events+json',
-            ...(EVENTSTORE_API_KEY ? { 'ES-ApiKey': EVENTSTORE_API_KEY } : {})
-        },
-        body: JSON.stringify(event)
-    });
+    // const url = ... declared above
+    try {
+        const res = await fetch(url, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/vnd.eventstore.events+json',
+                ...(EVENTSTORE_API_KEY ? { 'ES-ApiKey': EVENTSTORE_API_KEY } : {})
+            },
+            body: JSON.stringify(event)
+        });
 
-    if (!res.ok) {
-        const txt = await res.text().catch(() => '<no body>');
-        console.error(`EventStore publish failed: ${res.status} ${txt}`);
-        return false;
+        if (!res.ok) {
+            const txt = await res.text().catch(() => '<no body>');
+            console.error(`EventStore publish failed: ${res.status} ${txt}`);
+            return false;
+        }
+        return true;
+    } catch (error: any) {
+        console.warn(`Failed to publish to EventStore (Service might be down): ${error.message}`);
+        return false; // Fail gracefully
     }
     return true;
 }
@@ -52,7 +60,19 @@ export async function POST(req: Request) {
     }
     
     const body = await req.text();
-    const signature = headers().get('stripe-signature') as string;
+    const headersList = await headers();
+    const signature = headersList.get('stripe-signature') as string;
+
+    // Call local ledger/burn handler (PR feature)
+    try {
+        // @ts-ignore
+        const { handleWebhookRaw } = require('../../../../../backend/webhook');
+        await handleWebhookRaw(body, signature);
+        console.log("Local ledger/burn handler processed successfully.");
+    } catch (e: any) {
+        console.error("Local ledger handler failed:", e.message);
+        // Don't fail the request yet, let EventStore try
+    }
 
     let event: Stripe.Event;
 
@@ -63,7 +83,8 @@ export async function POST(req: Request) {
     }
 
     // This metadata would need to be set when creating the PaymentIntent
-    const order_id = event.data.object.metadata?.order_id;
+    const eventObject = event.data.object as { metadata?: { order_id?: string } };
+    const order_id = eventObject.metadata?.order_id;
     if (!order_id) {
          console.warn("Received Stripe event without order_id in metadata", event.id);
          // Still acknowledge receipt to Stripe
@@ -89,6 +110,33 @@ export async function POST(req: Request) {
                 order_id,
                 merchant_receipt: paymentIntentSucceeded.id
             });
+
+            // --- INTEGRATION: Mint sFIAT ---
+            // Assuming the 'receipt_email' or a metadata field contains the user's wallet address.
+            // For now, we look for 'wallet_address' in metadata.
+            const wallet_address = paymentIntentSucceeded.metadata?.wallet_address;
+            
+            if (wallet_address) {
+                try {
+                    const amountEth = (paymentIntentSucceeded.amount / 100).toString(); // Stripe is in cents
+                    await sovrService.mintsFIAT(wallet_address, amountEth);
+                    console.log(`Minted ${amountEth} sFIAT to ${wallet_address}`);
+                    
+                    await publishEvent(stream, 'AssetMinted', {
+                        asset: 'sFIAT',
+                        amount: amountEth,
+                        to: wallet_address
+                    });
+                } catch (mintError: any) {
+                    console.error("Minting failed:", mintError.message);
+                    await publishEvent(stream, 'MintingFailed', {
+                        reason: mintError.message
+                    });
+                }
+            } else {
+                console.warn("No wallet_address found in payment metadata. Skipping mint.");
+            }
+            // -------------------------------
             break;
 
         case 'payment_intent.payment_failed':
